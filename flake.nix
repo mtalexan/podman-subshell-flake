@@ -55,8 +55,9 @@
             # networking backend — must match podman version so we have to provide our own.
             netavark
             aardvark-dns
-            # not just yq, which has a different interface, yq-go.
-            yq-go
+            # dasel for TOML config file manipulation, jq for JSON operations. yq-go can't handle podman TOML config files.
+            dasel
+            jq
           ];
 
           # Allows environment overrides for:
@@ -161,9 +162,9 @@
                 #   1: <conf_file>
                 _set_runtime_tools() {
                     local conf_file="$1"
-                    yq -i -p toml -o toml ".engine.runtime = \"crun\"" "$conf_file"
-                    yq -i -p toml -o toml ".engine.conmon_path = [\"${pkgs.conmon}/bin/conmon\"]" "$conf_file"
-                    yq -i -p toml -o toml ".engine.runtimes.crun = [\"${pkgs.crun}/bin/crun\"]" "$conf_file"
+                    dasel put -f "$conf_file" -r toml -w toml -t string -v "crun" '.engine.runtime'
+                    dasel put -f "$conf_file" -r toml -w toml -t json -v "[\"${pkgs.conmon}/bin/conmon\"]" '.engine.conmon_path'
+                    dasel put -f "$conf_file" -r toml -w toml -t json -v "[\"${pkgs.crun}/bin/crun\"]" '.engine.runtimes.crun'
                 }
 
                 # Copy a config file from the first directory that contains it.
@@ -229,16 +230,22 @@
                 # effective host configuration. This matches how containers/storage itself
                 # would resolve settings across all config files.
                 # If no host layers exist, the file remains empty — downstream reads will
-                # simply get empty/default values from yq, which is handled naturally.
+                # simply get empty/default values, which is handled naturally.
 
                 local merged_host_storage_conf="$conf_dir/.host-storage-merged.conf"
                 rm -f "$merged_host_storage_conf"
                 touch "$merged_host_storage_conf"
                 local layer
+                local json_base json_layer
                 for layer in "''${host_storage_conf_layers[@]}"; do
                     # Deep merge: higher-priority layer's values override, unset fields preserved
-                    yq eval-all -p toml -o toml 'select(fileIndex == 0) * select(fileIndex == 1)' \
-                        "$merged_host_storage_conf" "$layer" > "$merged_host_storage_conf.tmp" \
+                    json_base=$(dasel -f "$merged_host_storage_conf" -r toml -w json '.' 2>/dev/null || echo '{}')
+                    json_layer=$(dasel -f "$layer" -r toml -w json '.' 2>/dev/null || echo '{}')
+                    jq          -n \
+                                --argjson a "$json_base" \
+                                --argjson b "$json_layer" \
+                                '$a * $b' \
+                            | dasel -r json -w toml > "$merged_host_storage_conf.tmp" \
                         && mv "$merged_host_storage_conf.tmp" "$merged_host_storage_conf"
                 done
                 # clean up any leftover tmp file
@@ -252,12 +259,18 @@
                 # runs after Nix has already prepended its own podman to PATH. Additionally,
                 # not all values we need are even available from `podman info`.
 
+                # Convert merged config to JSON once for efficient querying
+                local merged_json
+                merged_json=$(dasel -f "$merged_host_storage_conf" -r toml -w json '.' 2>/dev/null || echo '{}')
+
                 local host_driver
-                host_driver=$(yq -p toml '.storage.driver // ""' "$merged_host_storage_conf" 2>/dev/null || echo "")
+                host_driver=$(echo "$merged_json" | jq -r '.storage.driver // ""')
                 local host_graphroot
-                host_graphroot=$(yq -p toml '.storage.graphroot // ""' "$merged_host_storage_conf" 2>/dev/null || echo "")
+                host_graphroot=$(echo "$merged_json" | jq -r '.storage.graphroot // ""')
                 local host_additional_stores
-                host_additional_stores=$(yq -p toml -o json '.storage.options.additionalimagestores // []' "$merged_host_storage_conf" 2>/dev/null || echo "[]")
+                host_additional_stores=$(echo "$merged_json" | jq '.storage.options.additionalimagestores // []')
+                local host_runroot
+                host_runroot=$(echo "$merged_json" | jq -r '.storage.runroot // ""')
 
                 # If graphroot wasn't explicitly set in any config file, use the standard rootless default
                 if [[ -z "$host_graphroot" ]]; then
@@ -269,15 +282,13 @@
 
                 # Add host graphroot first (highest priority) if it exists on disk so we can still access it as a read-only store.
                 if [[ -d "$host_graphroot" ]]; then
-                    additional_stores_json=$(echo "$additional_stores_json" | yq ". + [\"$host_graphroot\"]")
+                    additional_stores_json=$(echo "$additional_stores_json" | jq --arg g "$host_graphroot" '. + [$g]')
                 fi
 
                 # Add host's existing additionalimagestores in their original order
                 if [[ "$host_additional_stores" != "null" && "$host_additional_stores" != "[]" ]]; then
-                    additional_stores_json=$(echo "$additional_stores_json" | yq ". + $host_additional_stores")
+                    additional_stores_json=$(echo "$additional_stores_json" | jq --argjson s "$host_additional_stores" '. + $s')
                 fi
-                local host_runroot
-                host_runroot=$(yq -p toml '.storage.runroot // ""' "$merged_host_storage_conf" 2>/dev/null || echo "")
 
                 # done parsing settings from it, so remove it
                 rm -f "$merged_host_storage_conf"
@@ -329,7 +340,7 @@
 
                     # Storage driver: only update if explicitly overridden via env var
                     if [[ -n "''${PODMAN_FLAKE_STORAGE_DRIVER:-}" ]]; then
-                        yq -i -p toml -o toml ".storage.driver = \"$storage_driver\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "$storage_driver" '.storage.driver'
                     fi
 
                     # Runroot handling
@@ -338,18 +349,18 @@
                         # Force isolated runroot for separate rootless-netns
                         runroot="''${storage_path}-run"
                         mkdir -p "$runroot"
-                        yq -i -p toml -o toml ".storage.runroot = \"$runroot\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "$runroot" '.storage.runroot'
                     elif [[ -n "$host_runroot" ]]; then
                         # Host specifies a runroot — use it for shared netns
-                        yq -i -p toml -o toml ".storage.runroot = \"$host_runroot\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "$host_runroot" '.storage.runroot'
                         echo "WARNING: Shared netns, named networks must not conflict. Set PODMAN_FLAKE_NETNS_ISOLATE=1 to isolate the runroot and avoid this." >&2
                     fi
 
                     # Nixpkg path: fuse-overlayfs mount_program — only replace if already a nix store path
                     local existing_mount_program
-                    existing_mount_program=$(yq -p toml '.storage.options.overlay.mount_program // ""' "$storage_conf" 2>/dev/null || echo "")
+                    existing_mount_program=$(dasel -f "$storage_conf" -r toml -w json '.storage.options.overlay.mount_program' 2>/dev/null | jq -r '.' 2>/dev/null || echo "")
                     if [[ "$existing_mount_program" == /nix/store/* ]]; then
-                        yq -i -p toml -o toml ".storage.options.overlay.mount_program = \"${pkgs.fuse-overlayfs}/bin/fuse-overlayfs\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs" '.storage.options.overlay.mount_program'
                     fi
 
                 else
@@ -361,27 +372,27 @@
                         "${defaultStorageConf}"
 
                     # Apply required storage overrides
-                    yq -i -p toml -o toml ".storage.driver = \"$storage_driver\"" "$storage_conf"
-                    yq -i -p toml -o toml ".storage.graphroot = \"$storage_path\"" "$storage_conf"
+                    dasel put -f "$storage_conf" -r toml -w toml -t string -v "$storage_driver" '.storage.driver'
+                    dasel put -f "$storage_conf" -r toml -w toml -t string -v "$storage_path" '.storage.graphroot'
                     mkdir -p "$storage_path"
 
                     # Runroot handling — controlled by PODMAN_FLAKE_NETNS_ISOLATE
                     local existing_runroot
-                    existing_runroot=$(yq -p toml '.storage.runroot // ""' "$storage_conf" 2>/dev/null || echo "")
+                    existing_runroot=$(dasel -f "$storage_conf" -r toml -w json '.storage.runroot' 2>/dev/null | jq -r '.' 2>/dev/null || echo "")
                     local runroot
                     if [[ -n "''${PODMAN_FLAKE_NETNS_ISOLATE:-}" ]] || [[ -z "$existing_runroot" ]]; then
                         # Force isolated runroot for separate rootless-netns
                         runroot="''${storage_path}-run"
                         mkdir -p "$runroot"
-                        yq -i -p toml -o toml ".storage.runroot = \"$runroot\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "$runroot" '.storage.runroot'
                     else
                         # Using host's runroot — shared netns
                         echo "WARNING: Shared netns, named networks must not conflict. Set PODMAN_FLAKE_NETNS_ISOLATE=1 to isolate the runroot and avoid this." >&2
                     fi
 
-                    yq -i -p toml -o toml ".storage.imagestore = \"$storage_path\"" "$storage_conf"
-                    yq -i -p toml -o toml ".storage.rootless_storage_path = \"$storage_path\"" "$storage_conf"
-                    yq -i -p toml -o toml ".storage.options.additionalimagestores = $additional_stores_json" "$storage_conf"
+                    dasel put -f "$storage_conf" -r toml -w toml -t string -v "$storage_path" '.storage.imagestore'
+                    dasel put -f "$storage_conf" -r toml -w toml -t string -v "$storage_path" '.storage.rootless_storage_path'
+                    dasel put -f "$storage_conf" -r toml -w toml -t json -v "$additional_stores_json" '.storage.options.additionalimagestores'
 
                     # If we're using overlay driver, and the host also was, keep all the host settings.
                     # If the host wasn't using overlay, or we have no host config, we need to wipe and fully
@@ -404,11 +415,11 @@
                     if [[ "$own_overlay" == "true" ]]; then
                         # Wipe all existing overlay options — they may be kernel-overlay-specific
                         # (e.g., metacopy=on, volatile, userxattr) which are incompatible with fuse-overlayfs
-                        yq -i -p toml -o toml '.storage.options.overlay = {}' "$storage_conf"
+                        dasel delete -f "$storage_conf" -r toml -w toml '.storage.options.overlay' 2>/dev/null || true
                         # Set fuse-overlayfs as mount program
-                        yq -i -p toml -o toml ".storage.options.overlay.mount_program = \"${pkgs.fuse-overlayfs}/bin/fuse-overlayfs\"" "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs" '.storage.options.overlay.mount_program'
                         # Set default fuse-overlayfs-compatible mount options
-                        yq -i -p toml -o toml '.storage.options.overlay.mountopt = "nodev"' "$storage_conf"
+                        dasel put -f "$storage_conf" -r toml -w toml -t string -v "nodev" '.storage.options.overlay.mountopt'
                     fi
                 fi
 
@@ -437,7 +448,8 @@
                     # and manual user additions. For each nixpkg we provide, remove the old nix
                     # store entry for the same package (if any), then prepend all our paths at
                     # the front so they take priority (first-match-wins, like PATH).
-                    yq -i -p toml -o toml '.engine.helper_binaries_dir //= []' "$containers_conf"
+                    local current_helpers
+                    current_helpers=$(dasel -f "$containers_conf" -r toml -w json '.engine.helper_binaries_dir' 2>/dev/null || echo '[]')
 
                     local pkg store_basename name_ver name pattern
                     for pkg in "''${flake_helper_pkgs[@]}"; do
@@ -447,13 +459,15 @@
                         name="''${name_ver%%-[0-9]*}"
                         pattern="/nix/store/[a-z0-9]{32}-''${name}-"
                         # Remove any existing entry for this package (old nix store path from prior run)
-                        yq -i -p toml -o toml "del(.engine.helper_binaries_dir[] | select(test(\"$pattern\")))" "$containers_conf"
+                        current_helpers=$(echo "$current_helpers" | jq --arg p "$pattern" '[.[] | select(test($p) | not)]')
                     done
 
                     # Prepend all our helper paths at once, in defined order (first-match-wins)
                     local helpers_json
                     helpers_json=$(_build_helpers_json "''${flake_helper_pkgs[@]}")
-                    yq -i -p toml -o toml ".engine.helper_binaries_dir = $helpers_json + .engine.helper_binaries_dir" "$containers_conf"
+                    local merged_helpers
+                    merged_helpers=$(jq -n --argjson new "$helpers_json" --argjson cur "$current_helpers" '$new + $cur')
+                    dasel put -f "$containers_conf" -r toml -w toml -t json -v "$merged_helpers" '.engine.helper_binaries_dir'
 
                 else
                     # === FRESH FILE: create and fully configure ===
@@ -468,7 +482,7 @@
                     # it already handles this correctly.
                     if (( ''${#host_containers_conf_layers[@]} == 0 )); then
                         if [[ -d /run/systemd/system ]] && systemctl --user status >/dev/null 2>&1; then
-                            yq -i -p toml -o toml '.engine.cgroup_manager = "systemd"' "$containers_conf"
+                            dasel put -f "$containers_conf" -r toml -w toml -t string -v "systemd" '.engine.cgroup_manager'
                         fi
                     fi
 
@@ -479,7 +493,10 @@
                     # (first-match-wins, like PATH). Covers pasta, netavark, aardvark-dns.
                     local helpers_json
                     helpers_json=$(_build_helpers_json "''${flake_helper_pkgs[@]}")
-                    yq -i -p toml -o toml ".engine.helper_binaries_dir = $helpers_json + (.engine.helper_binaries_dir // [])" "$containers_conf"
+                    current_helpers=$(dasel -f "$containers_conf" -r toml -w json '.engine.helper_binaries_dir' 2>/dev/null || echo '[]')
+                    local merged_helpers
+                    merged_helpers=$(jq -n --argjson new "$helpers_json" --argjson cur "$current_helpers" '$new + $cur')
+                    dasel put -f "$containers_conf" -r toml -w toml -t json -v "$merged_helpers" '.engine.helper_binaries_dir'
 
                     # Network configuration — always isolated per flake instance.
                     # Named network configs go in here and have to be unique for each netavark.
@@ -487,7 +504,7 @@
                     #          must be unique per runroot. The PODMAN_FLAKE_NETNS_ISOLATE=1 can ensure a unique runroot.
                     local net_dir="$conf_dir/networks"
                     mkdir -p "$net_dir"
-                    yq -i -p toml -o toml ".network.network_config_dir = \"$net_dir\"" "$containers_conf"
+                    dasel put -f "$containers_conf" -r toml -w toml -t string -v "$net_dir" '.network.network_config_dir'
                 fi
 
                 ########################
